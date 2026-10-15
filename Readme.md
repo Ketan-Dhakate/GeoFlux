@@ -1,4 +1,4 @@
-# GeoPulse
+# GeoFlux
 
 **A high-concurrency location tracking and spatial ingestion engine.**
 
