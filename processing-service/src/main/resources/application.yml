@@ -1,0 +1,164 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: processing-service
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      # THE group id. All instances sharing this string form one group, and
+      # Kafka divides the 12 partitions among them. Change it and you get a
+      # SECOND independent group that re-reads the whole topic from scratch —
+      # a genuinely useful trick for backfills, and a nasty surprise if done
+      # by accident (e.g. a typo in a deploy config).
+      group-id: geopulse-location-processor
+
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+
+      # Where to start when a group has NO committed offset (brand new group,
+      # or offsets expired). Options: earliest | latest | none.
+      #
+      # We use `earliest` in dev so a fresh consumer drains the messages we
+      # already produced in Phase 1 — otherwise you'd start a consumer, see
+      # nothing happen, and wonder what broke.
+      #
+      # PRODUCTION would arguably use `latest`: on a brand-new group you rarely
+      # want to replay hours of stale location data — a 2-hour-old position is
+      # worse than useless, it's WRONG. Note this setting only applies when
+      # there's no committed offset; it does NOT mean "skip messages on restart."
+      auto-offset-reset: earliest
+
+      # Turn OFF auto-commit. With it on, Kafka commits offsets on a timer,
+      # INDEPENDENTLY of whether we processed anything — so a crash between a
+      # timer commit and the actual write silently LOSES messages.
+      # We want commits tied to processing completion. See ack-mode below.
+      enable-auto-commit: false
+
+      # How many records one poll() returns. See the poll-deadline math below.
+      max-poll-records: 500
+
+      properties:
+        # Two settings shape how much data a poll() pulls:
+        # Wait for at least this much data before returning a fetch — fewer,
+        # fatter requests to the broker. Default is 1 byte, meaning "return
+        # immediately with whatever exists," which is latency-optimal and
+        # throughput-poor.
+        fetch.min.bytes: 65536       # 64KB
+
+        # ...but don't wait longer than this for it to accumulate. This is the
+        # LATENCY BOUND on the above — the mirror of the producer's linger.ms.
+        # Under load, 64KB fills in microseconds and this never triggers. When
+        # traffic is sparse, it stops us stalling.
+        fetch.max.wait.ms: 100
+
+        # ---- The rebalance-storm guard ----
+        # If we don't call poll() again within this window, Kafka declares us
+        # dead and reassigns our partitions. The arithmetic that must hold:
+        #   max-poll-records × per-record time  <<  max.poll.interval.ms
+        #   500 × ~5ms = 2.5s   vs   300,000ms   → enormous margin, deliberately.
+        max.poll.interval.ms: 300000
+
+        # Heartbeats run on a BACKGROUND thread and prove liveness. This is
+        # SEPARATE from the poll deadline: heartbeats say "the process is alive",
+        # poll interval says "the process is making progress." A consumer stuck
+        # in a slow write keeps heartbeating while failing to poll — which is
+        # exactly why both checks exist.
+        session.timeout.ms: 45000
+        heartbeat.interval.ms: 3000
+
+        # Tell the deserializer what type to build. Required because we turned
+        # OFF type headers on the producer side (Session 1.3) — the message is
+        # plain JSON with no embedded Java class name, by design.
+        spring.json.value.default.type: com.geopulse.common.model.LocationPing
+        spring.json.trusted.packages: com.geopulse.common.model
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+
+        # Cooperative rebalancing: only the partitions that MUST move are
+        # revoked; everything else keeps processing. Without this, every
+        # deploy/scale event stops the entire group.
+        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+
+    listener:
+        # Commit offsets after the listener returns for a batch of records.
+        # Since our listener only returns after the write succeeds, this gives us
+        # AT-LEAST-ONCE semantics — the choice from Part 1.
+      ack-mode: batch
+        # Hand the listener the WHOLE poll() result instead of looping over it.
+        # This is what lets us pipeline the downstream writes.
+      type: batch
+
+        # Consumer threads in THIS instance, each taking distinct partitions.
+        # 3 instances × concurrency 4 = 12 threads for 12 partitions = one each.
+      concurrency: 4
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      lettuce:
+        pool:
+          max-active: 32
+          max-idle: 16
+          min-idle: 8
+  cassandra:
+    keyspace-name: geopulse   # the writer's prepared statements use unqualified table names
+    request:
+      # Written out for visibility (it's the driver default): bounds how long
+      # one write can take, which bounds each retry attempt's processing time.
+      timeout: 2s
+      throttler:
+        # The concurrency bound promised in Part 2. 500 pings × 2 tables =
+        # 1,000 async writes per batch, per listener thread — enough to exceed
+        # the driver's per-connection limit. At most 512 in flight; the rest
+        # queue client-side. Past 10,000 queued, requests fail fast with
+        # RequestThrottlingException — registered as TRANSIENT below.
+        # Bounded concurrency is backpressure.
+        type: concurrency-limiting
+        max-concurrent-requests: 512
+        max-queue-size: 10000
+    contact-points: localhost
+    port: 9042
+    local-datacenter: datacenter1   # MUST match CASSANDRA_DC from Part 3, or startup fails
+    schema-action: none             # don't create/validate schema at boot — Phase 4 owns that
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    tags:
+      # Applied to EVERY metric from this service. Without it, three services
+      # scraped into one Prometheus produce indistinguishable series with the
+      # same names — you'd be summing ingestion and query latencies together.
+      application: ${spring.application.name}
+  endpoint:
+    health:
+      show-details: always
+
+geopulse:
+  kafka:
+    topic: driver-location-pings
+    history-group-id: geopulse-history-writer
+    history-dlt: driver-location-pings-history-dlt
+  dedup:
+    # How long a dedup key survives. Sized to cover realistic redelivery paths
+    # (rebalance reprocessing = seconds; producer retries = ms) with margin.
+    # NOT absolute: a duplicate arriving later than this slips through — a
+    # deliberate memory-vs-completeness trade.
+    # At 250k/s this is ~75M keys ≈ 5-7GB Redis. Tune down if memory is tight.
+    ttl-seconds: 300
+  activity:
+    ttl-seconds: 900
+  redis:
+    # How long a driver stays "present" without pinging. Pings arrive every 4s,
+    # so 30s tolerates ~7 consecutive misses — enough to survive a tunnel,
+    # short enough that a dead driver disappears fast.
+    # Tunable tradeoff: false-offline vs ghost-driver.
+    presence-ttl-seconds: 30
+  hotcell:
+    scan-interval-ms: 30000
+    median-multiplier: 10.0
+    min-pings: 500    # floor; tune against a real load test us this  value as a threshold abive  which salting will occur
+    salt: 4

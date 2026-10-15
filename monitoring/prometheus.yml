@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Our services run on the HOST; Prometheus runs in a CONTAINER. Inside a
+  # container `localhost` means the container itself, so we escape to the host
+  # via host.docker.internal. (The mirror image of the Kafka advertised-listener
+  # problem from Phase 0.2 — "localhost" is always relative to who's asking.)
+  - job_name: geopulse
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - "host.docker.internal:8081"
+          - "host.docker.internal:8082"
+          - "host.docker.internal:8083"
